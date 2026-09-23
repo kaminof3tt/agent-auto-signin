@@ -148,6 +148,20 @@ function writeState(s) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2), 'utf8');
 }
 
+// 记录"某产品今天确实领取成功过"（含幂等 replay 之外的首次领取），
+// 用于同日重跑时不再重复报 [注意]（服务端此时已把该活动变为 CLAIMED、claimable=false）
+function markClaimed(product) {
+  const s = readState();
+  if (!s.claims || typeof s.claims !== 'object') s.claims = {};
+  s.claims[product.key] = todayStr();
+  writeState(s);
+}
+
+function claimedToday(product) {
+  const s = readState();
+  return Boolean(s.claims && s.claims[product.key] === todayStr());
+}
+
 async function httpJson(url, { method = 'GET', headers = {}, body, timeoutMs = 30000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -397,6 +411,17 @@ function pickHighestVersion(dir) {
   return versions.sort(compareVersions).pop();
 }
 
+// 扁平安装布局没有 .qoder-versions 目录，改读安装目录内的 build-manifest.json（版本最准）
+function buildManifestVersion(installDir) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(installDir, 'resources', 'build-manifest.json'), 'utf8'));
+    const v = j && j.productVersion;
+    return v ? String(v).trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 const CLIENT_VERSION_CACHE = new Map();
 
 // 探测客户端版本：启动器 state.ini 的 targetVersion（最准）→ 安装目录里最高的 .qoder-versions 版本 → 内置兜底
@@ -413,6 +438,7 @@ function resolveClientVersion(product) {
     v = target;
   }
   if (!v && installDir) v = pickHighestVersion(path.join(installDir, '.qoder-versions'));
+  if (!v && installDir) v = buildManifestVersion(installDir);
   if (!v) v = target;
   let fromFallback = false;
   if (!v) { v = product.fallbackVersion; fromFallback = true; }
@@ -468,12 +494,28 @@ function machineIdOf(product) {
 
 const MACHINE_IDENTITY_CACHE = new Map();
 const MACHINE_IDENTITY_TTL_MS = 30 * 60 * 1000; // 令牌可能有时效，半小时后重新取
+const IDENTITY_WARNED = new Set();
+
+// 取不到机器身份是"活动被隐藏"的根因，但以前是静默降级（catch 吞掉），
+// 表现成"桌面端明明可领、脚本却查不到"且日志里毫无线索。这里每个产品只提示一次。
+function warnIdentityOnce(product, reason) {
+  if (IDENTITY_WARNED.has(product.key)) return;
+  IDENTITY_WARNED.add(product.key);
+  log([`${product.name}: 未能取到机器身份头（${reason}）；服务端可能因此隐藏日常权益活动（Cosy-Machine* 缺失）`]);
+}
 
 function runtimeInfoPath(product) {
   const installDir = iniValue(path.join(LOCALAPPDATA, product.launcherDir, 'state.ini'), 'launcher', 'installDir');
   if (!installDir) return null;
-  const exe = path.join(installDir, '.qoder-versions', resolveClientVersion(product), 'resources', 'umid', 'runtime-info.exe');
-  return fs.existsSync(exe) ? exe : null;
+  // 客户端有两种安装布局，都要覆盖（否则机器身份头取不到 → 日常权益活动被服务端隐藏）：
+  //   分层布局（新版安装器，如 Qoder CN）: <installDir>\.qoder-versions\<version>\resources\umid\runtime-info.exe
+  //   扁平布局（2026-09-22 国际版更新后）: <installDir>\resources\umid\runtime-info.exe
+  const candidates = [
+    path.join(installDir, '.qoder-versions', resolveClientVersion(product), 'resources', 'umid', 'runtime-info.exe'),
+    path.join(installDir, 'resources', 'umid', 'runtime-info.exe'),
+  ];
+  for (const exe of candidates) if (fs.existsSync(exe)) return exe;
+  return null;
 }
 
 // 返回 { machineToken, machineCode, machineType } 或 null（拿不到时由调用方降级处理）
@@ -482,7 +524,10 @@ function machineIdentityOf(product, userId) {
   if (cached && Date.now() - cached.at < MACHINE_IDENTITY_TTL_MS) return cached.value;
 
   const exe = runtimeInfoPath(product);
-  if (!exe) return null;
+  if (!exe) {
+    warnIdentityOnce(product, '未找到 runtime-info.exe，客户端安装布局可能已变化');
+    return null;
+  }
   let value = null;
   try {
     const out = execFileSync(exe, [String(product.regionEnv), '--account-stdin'], {
@@ -500,8 +545,9 @@ function machineIdentityOf(product, userId) {
         machineType: String(parsed.machineType),
       };
     }
-  } catch {
+  } catch (e) {
     value = null; // 失败不缓存，下次重试
+    warnIdentityOnce(product, `调用 runtime-info.exe 失败: ${(e.message || String(e)).slice(0, 120)}`);
   }
   if (value) MACHINE_IDENTITY_CACHE.set(product.key, { at: Date.now(), value });
   return value;
@@ -580,6 +626,13 @@ function pickTargets(list) {
   return camps.filter((c) => c.claimStatus === 'CLAIMABLE');
 }
 
+// 列表中是否存在"现在就能领"的活动：服务端聚合标记 claimable 与逐条 claimStatus 双重判断
+function hasClaimable(list) {
+  if (list && list.claimable === true) return true;
+  const camps = (list && list.campaigns) || [];
+  return camps.some((c) => c && c.claimStatus === 'CLAIMABLE');
+}
+
 // 拿不到可领取活动时，把接口返回的关键信息落进日志，便于下次定位（而不是只报一句"无活动"）
 function describeList(list) {
   const camps = (list.campaigns || []).filter((c) => c && typeof c === 'object');
@@ -602,8 +655,9 @@ function expiryWarning(auth) {
   return null;
 }
 
-// 返回 { msg, pending, detail }
+// 返回 { msg, pending, detail?, warn? }
 //   pending=true 表示"服务端当前没有可领取的活动"（不是失败，但也不能算完成，交由上层重试）
+//   warn=true    表示"列表里根本没有任何可领取活动（存量已领活动掩盖不了）"——记 [注意]，不重试
 async function checkinProduct(product) {
   const { auth, base, headers, identityOk } = loadProduct(product);
   const list = await listCampaigns(headers, base);
@@ -623,6 +677,7 @@ async function checkinProduct(product) {
   }
 
   const parts = [];
+  let claimedNow = false; // 本轮是否真的领到了新权益（幂等 replay 不算）
   for (const campaign of targets) {
     const title = campaignTitle(campaign) || campaign.campaignKey || '活动';
     const amount = describeCampaign(campaign);
@@ -646,10 +701,25 @@ async function checkinProduct(product) {
     const claim = await claimCampaign(headers, base, campaign);
     const exp = localTime(claim.expiresAt);
     const gained = claim.replayed ? `今日已领取 ${amount}` : `成功领取 ${amount}`;
+    if (!claim.replayed) claimedNow = true;
     parts.push(`${title}：${gained}${exp ? `（有效期至 ${exp}）` : ''}`);
   }
 
   if (warn) parts.push(warn);
+
+  if (claimedNow) markClaimed(product);
+
+  // 漏报修复（2026-09-23 实测踩到）：pickTargets 只看 actionType=CLAIM_BENEFIT，
+  // 存量活动（如「久等了，感谢您还在」500 Credits，状态 CLAIMED）同样会命中，
+  // 于是"今天的日常活动根本没出现在列表里"被当作成功糊弄过去
+  // —— 当时国际版只回 2 条已领活动、claimable=false，脚本却报 [成功]，
+  // 真正的原因是机器身份头（Cosy-Machine*）缺失导致服务端隐藏了日常活动。
+  // 现在按"列表里没有任何可领取活动 + 今日尚未领取成功过"补一条 [注意]，而不是静默通过。
+  if (!hasClaimable(list) && !(claimedNow || claimedToday(product))) {
+    parts.push('[注意] 今日列表中没有可领取的权益活动（已领的存量活动不算）：可能服务端尚未放量，或机器身份头（Cosy-Machine*）缺失导致活动被隐藏');
+    return { pending: false, warn: true, msg: parts.join('；') };
+  }
+
   return { pending: false, msg: parts.join('；') };
 }
 
@@ -684,7 +754,7 @@ async function statusProduct(product) {
   if (lines.length === 0) lines.push('暂无可参与的活动');
   lines.push(`客户端: Cosy-Version=${version} | Cosy-MachineOS=${headers['Cosy-MachineOS']} | 机器身份=${identityOk ? '已带上' : '缺失（活动可能被隐藏）'}`);
   lines.push(`活动入口: ${describeList(list)}`);
-  if (pickTargets(list).length === 0) lines.push('[注意] 列表中没有可领取的权益活动（若在领取窗口内，多半是服务端尚未对该账号放量）');
+  if (!hasClaimable(list)) lines.push('[注意] 列表中没有可领取的权益活动（已领的存量活动不算；若在领取窗口内，多半是服务端尚未放量，或机器身份头缺失导致活动被隐藏）');
   const warn = expiryWarning(auth);
   if (warn) lines.push(`[注意] ${warn}`);
   return lines;
@@ -745,6 +815,10 @@ async function runRound(mode = 'auto') {
         // 到点还是没放量：算"未完成"，写 CRITICAL 引起注意，而不是当成成功糊弄过去
         results.push({ name: p.name, ok: true, warn: true, msg: r.msg });
         logCritical(`${p.name} 未领取`, r.msg);
+      } else if (r.warn) {
+        // 活动列表里压根没有可领取的权益（存量活动掩盖不了）——同样只算 [注意]，不算失败
+        results.push({ name: p.name, ok: true, warn: true, msg: r.msg });
+        logCritical(`${p.name} 未取得今日新权益`, r.msg);
       } else {
         results.push({ name: p.name, ok: true, msg: r.msg });
       }
