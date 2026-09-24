@@ -4,7 +4,7 @@
  * 整合自 daily-auto-checkin、trae-auto-signin、workbuddy-auto-signin 三份脚本（已移除 DuMate）。
  * 凭据全部从各应用本地存储实时读取（应用自身负责刷新令牌），脚本不落盘任何令牌。
  *
- * 用法（Node.js >= 18，零依赖）:
+ * 用法（Node.js >= 18；WorkBuddy 加密凭据路径需 >= 22.5，零第三方依赖）:
  *   node auto-signin.js [--once] [--dry-run] [--only=trae|workbuddy] [--status] [--refresh] [--growth] [--claim]
  *   默认进入守护循环，每天自动签到；--once 只执行一轮立即退出；
  *   --status 仅查询各产品签到状态（只读调试；WorkBuddy 附带成长中心各任务完成情况）；--refresh 强制执行一次 Trae 令牌续期（调试）。
@@ -12,6 +12,13 @@
  *
  * 特性:
  *   - WorkBuddy：签到 + 成长中心（领 Buddy 旅行礼物 / 派 Buddy 出发 / 开盲盒 / 领任务奖）
+ *     凭据获取：优先读 workbuddy-desktop.info 的明文 accessToken；若已被客户端加密
+ *     （5.6.2 起为 {"$wbEncrypted":1,"envelope":"..."}，密钥在原生层、独立 Node 取不到），
+ *     则自动改从 CodeBuddy CN 的 SecretStorage（state.vscdb）解密同一登录态：
+ *     Chromium os_crypt = [3B "v10"][12B nonce][AES-256-GCM 密文][16B tag]，
+ *     其 AES-256 密钥存于 Local State 的 os_crypt.encrypted_key（DPAPI 保护）。
+ *     DPAPI 优先用 WorkBuddy 自带 koffi 直接调用 crypt32（**不创建子进程**，受限会话亦可），
+ *     失败再回退 PowerShell / 内置 Python。
  *   - Trae：签到 + 令牌自动续期（临近过期时用设备密钥对调用官方接口，写回 storage.json）
  *   - 内置每日自动运行（常驻守护，默认每天 09:30，可用环境变量 CHECKIN_TIME / CHECKIN_TIMES 覆盖）
  *   - 幂等保护（已在检查查询层兜底"今日已签到"）
@@ -29,7 +36,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 
 // ---------------- CLI / 环境解析 ----------------
 const DRY_RUN = process.argv.includes('--dry-run');
@@ -225,12 +232,239 @@ function findWorkbuddyAuthFile() {
   return null;
 }
 
-function loadWorkbuddy() {
-  const authFile = findWorkbuddyAuthFile();
-  if (!authFile) {
-    throw new Error('未找到 WorkBuddy 登录凭据。请先在本机登录 WorkBuddy 桌面端，或设置环境变量 WORKBUDDY_AUTH_FILE 指向 workbuddy-desktop.info');
+// ---------------- WorkBuddy 凭据解密（Chromium os_crypt + Windows DPAPI） ----------------
+// 背景：WorkBuddy 桌面端自 5.6.2（2026-09-23 起生效）把 workbuddy-desktop.info 的
+// accessToken / refreshToken 由明文改为 at-rest 加密对象 {"$wbEncrypted":1,"envelope":"..."}，
+// 其密钥来自定制 Electron 原生绑定（独立 Node 无法获取），脚本读到 [object Object] → 401。
+// 但同一登录态在 CodeBuddy CN 扩展的 SecretStorage 中仍以明文语义保存，外层只是
+// Chromium os_crypt：[3B "v10"][12B nonce][AES-256-GCM 密文][16B tag]，
+// 其 AES-256 密钥存于 Local State 的 os_crypt.encrypted_key（DPAPI 保护，需同机同 Windows 用户）。
+// Node 不能直调 DPAPI，故借 PowerShell 的 ProtectedData（主路径，仓库既有做法），
+// 受限会话下 PowerShell 可能不可用（EBUSY），回退到内置 Python 的 ctypes 调用同一 API。
+
+const OS_CRYPT_PREFIX = 'DPAPI';
+const OS_CRYPT_MAGIC = 'v10';
+const CODEBUDDY_CN_DIR = path.join(APPDATA, 'CodeBuddy CN');
+const OS_CRYPT_KEY_CACHE = new Map();
+
+function powershellPath() {
+  const sys = process.env.SystemRoot || 'C:\\Windows';
+  const full = path.join(sys, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  return fs.existsSync(full) ? full : 'powershell.exe';
+}
+
+function pythonCandidates() {
+  const list = [];
+  if (process.env.WORKBUDDY_HELPER_PYTHON) list.push(process.env.WORKBUDDY_HELPER_PYTHON);
+  const managed = path.join(HOME, '.workbuddy', 'binaries', 'python', 'versions', '3.13.12', 'python.exe');
+  if (fs.existsSync(managed)) list.push(managed);
+  list.push('python', 'python3');
+  return list;
+}
+
+// Python 版 DPAPI（等价于 PowerShell 的 ProtectedData.Unprotect，CurrentUser 作用域）
+const DPAPI_PY_SCRIPT = [
+  'import ctypes, base64, sys',
+  'from ctypes import wintypes',
+  'class B(ctypes.Structure):',
+  '    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]',
+  'd = base64.b64decode(sys.argv[1])',
+  'bi = B(len(d), ctypes.cast(ctypes.create_string_buffer(d, len(d)), ctypes.POINTER(ctypes.c_char)))',
+  'bo = B()',
+  'ok = ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(bi), None, None, None, None, 0, ctypes.byref(bo))',
+  'if not ok: raise SystemExit("CryptUnprotectData failed")',
+  'buf = ctypes.create_string_buffer(bo.cbData)',
+  'ctypes.memmove(buf, bo.pbData, bo.cbData)',
+  'ctypes.windll.kernel32.LocalFree(bo.pbData)',
+  'sys.stdout.write(base64.b64encode(buf.raw).decode())',
+].join('\n');
+
+// WorkBuddy 自带 CLI 里打包了 koffi（FFI 库），可在**不创建子进程**的前提下调用
+// crypt32 的 CryptUnprotectData —— 这是最可靠的路径（受限会话会禁止 spawn 子进程）。
+let KOFFI_DPAPI;
+function loadKoffiDpapi() {
+  if (KOFFI_DPAPI !== undefined) return KOFFI_DPAPI;
+  const candidates = [];
+  if (process.env.WORKBUDDY_KOFFI_PATH) candidates.push(process.env.WORKBUDDY_KOFFI_PATH);
+  for (const base of [
+    path.join(LOCALAPPDATA, 'Programs', 'WorkBuddy'),
+    path.join(LOCALAPPDATA, 'Programs', 'workbuddy'),
+  ]) {
+    candidates.push(path.join(base, 'resources', 'app.asar.unpacked', 'cli', 'node_modules', 'koffi'));
   }
-  const session = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+  for (const dir of candidates) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      const koffi = require(dir);
+      const crypt32 = koffi.load('crypt32.dll');
+      koffi.struct('DATA_BLOB', { cbData: 'uint32', pbData: 'void *' });
+      const CryptUnprotectData = crypt32.func('int CryptUnprotectData(_In_ DATA_BLOB *pDataIn, void *p1, DATA_BLOB *p2, void *p3, void *p4, uint32 dwFlags, _Out_ DATA_BLOB *pDataOut)');
+      const LocalFree = koffi.load('kernel32.dll').func('void *LocalFree(void *hMem)');
+      KOFFI_DPAPI = { koffi, CryptUnprotectData, LocalFree };
+      return KOFFI_DPAPI;
+    } catch { /* 该候选不可用，尝试下一个 */ }
+  }
+  KOFFI_DPAPI = false;
+  return false;
+}
+
+function dpapiUnprotectViaKoffi(body) {
+  const m = loadKoffiDpapi();
+  if (!m) return null;
+  const { koffi, CryptUnprotectData, LocalFree } = m;
+  const inBlob = { cbData: body.length, pbData: koffi.as(body, 'void *') };
+  const outBlob = { cbData: 0, pbData: null };
+  const rc = CryptUnprotectData(inBlob, null, null, null, null, 0, outBlob);
+  if (!rc || !outBlob.cbData || !outBlob.pbData) return null;
+  try {
+    return Buffer.from(koffi.decode(outBlob.pbData, 'uint8', outBlob.cbData));
+  } finally {
+    try { LocalFree(outBlob.pbData); } catch { /* 忽略 */ }
+  }
+}
+
+// 用 DPAPI 解开 os_crypt 的 32B AES 密钥；优先 koffi（无子进程），再 PowerShell / Python
+function dpapiUnprotect(b64) {
+  const errors = [];
+  if (process.platform === 'win32') {
+    const body = Buffer.from(b64, 'base64');
+    try {
+      const key = dpapiUnprotectViaKoffi(body);
+      if (key && key.length === 32) return key;
+      errors.push('koffi: 未返回有效密钥');
+    } catch (e) {
+      errors.push('koffi: ' + String(e.message || e).slice(0, 120));
+    }
+    const script = [
+      '$ErrorActionPreference = "Stop"',
+      'Add-Type -AssemblyName System.Security',
+      `$b = [Convert]::FromBase64String('${b64}')`,
+      '$k = [Security.Cryptography.ProtectedData]::Unprotect($b, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)',
+      '[Convert]::ToBase64String($k)',
+    ].join('; ');
+    try {
+      const out = execFileSync(powershellPath(), ['-NoProfile', '-NonInteractive', '-Command', script], {
+        encoding: 'utf8', timeout: 30000, windowsHide: true,
+      }).trim();
+      const key = Buffer.from(out, 'base64');
+      if (key.length === 32) return key;
+      errors.push(`PowerShell 返回 ${key.length} 字节（期望 32）`);
+    } catch (e) {
+      errors.push('PowerShell: ' + String(e.stderr || e.message || e).trim().slice(0, 120));
+    }
+    for (const py of pythonCandidates()) {
+      try {
+        const out = execFileSync(py, ['-c', DPAPI_PY_SCRIPT, b64], {
+          encoding: 'utf8', timeout: 30000, windowsHide: true,
+        }).trim();
+        const key = Buffer.from(out, 'base64');
+        if (key.length === 32) return key;
+        errors.push(`${py}: 返回 ${key.length} 字节`);
+      } catch (e) {
+        errors.push(`${py}: ` + String(e.stderr || e.message || e).trim().slice(0, 120));
+      }
+    }
+  }
+  throw new Error('DPAPI 解密 os_crypt 密钥失败（需与登录 CodeBuddy 的同一 Windows 用户）: ' + errors.join(' | '));
+}
+
+function osCryptAesKey() {
+  const cached = OS_CRYPT_KEY_CACHE.get('codebuddy');
+  if (cached) return cached;
+  const lsPath = process.env.CODEBUDDY_LOCAL_STATE || path.join(CODEBUDDY_CN_DIR, 'Local State');
+  if (!fs.existsSync(lsPath)) throw new Error(`未找到 CodeBuddy CN 的 Local State：${lsPath}`);
+  const ls = JSON.parse(fs.readFileSync(lsPath, 'utf8'));
+  const b64 = ls && ls.os_crypt && ls.os_crypt.encrypted_key;
+  if (!b64) throw new Error('Local State 缺少 os_crypt.encrypted_key');
+  const raw = Buffer.from(b64, 'base64');
+  if (raw.subarray(0, OS_CRYPT_PREFIX.length).toString() !== OS_CRYPT_PREFIX) {
+    throw new Error(`os_crypt 密钥前缀非预期（${raw.subarray(0, 5).toString()}），可能客户端加密方式已变更`);
+  }
+  const key = dpapiUnprotect(raw.subarray(OS_CRYPT_PREFIX.length).toString('base64'));
+  OS_CRYPT_KEY_CACHE.set('codebuddy', key);
+  return key;
+}
+
+// [3B "v10"][12B nonce][密文][16B tag] → AES-256-GCM 明文
+function osCryptDecrypt(blob, key) {
+  if (blob.subarray(0, 3).toString() !== OS_CRYPT_MAGIC) {
+    throw new Error('密文缺少 v10 头，可能客户端加密方式已变更');
+  }
+  const nonce = blob.subarray(3, 15);
+  const tag = blob.subarray(blob.length - 16);
+  const ct = blob.subarray(15, blob.length - 16);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ct), decipher.final()]);
+}
+
+// 从 CodeBuddy CN 的 SecretStorage（state.vscdb）取出登录态原始字节
+function readCodeBuddySecretBytes(keyNeedle) {
+  const dbPath = process.env.CODEBUDDY_STATE_DB
+    || path.join(CODEBUDDY_CN_DIR, 'User', 'globalStorage', 'state.vscdb');
+  if (!fs.existsSync(dbPath)) throw new Error(`未找到 CodeBuddy 状态库：${dbPath}`);
+  let DatabaseSync;
+  try { ({ DatabaseSync } = require('node:sqlite')); } catch {
+    throw new Error('当前 Node 缺少 node:sqlite（需 Node >= 22.5），无法读取 CodeBuddy 状态库');
+  }
+  const query = (file) => {
+    const db = new DatabaseSync(file, { readOnly: true });
+    try {
+      const st = db.prepare('SELECT value FROM ItemTable WHERE key LIKE ? ORDER BY length(value) DESC LIMIT 1');
+      const row = st.get('%' + keyNeedle + '%');
+      return row ? row.value : null;
+    } finally { try { db.close(); } catch { /* 忽略关闭异常 */ } }
+  };
+  let value;
+  try {
+    value = query(dbPath);
+  } catch (e) {
+    // 数据库可能被运行中的客户端以写模式占用，复制副本后以只读方式再读
+    const tmp = path.join(os.tmpdir(), `wb-state-${process.pid}-${Date.now()}.vscdb`);
+    fs.copyFileSync(dbPath, tmp);
+    try { value = query(tmp); } finally { try { fs.rmSync(tmp, { force: true }); } catch { /* 忽略 */ } }
+  }
+  if (value == null) throw new Error('状态库中未找到登录态（secret key 缺失），请确认已登录 CodeBuddy CN 客户端');
+  if (Buffer.isBuffer(value)) return value;
+  const text = String(value);
+  // SecretStorage 以 {"type":"Buffer","data":[...]} 形式序列化
+  try {
+    const obj = JSON.parse(text);
+    if (obj && obj.type === 'Buffer' && Array.isArray(obj.data)) return Buffer.from(obj.data);
+    if (typeof obj === 'string') return Buffer.from(obj, 'utf8');
+  } catch { /* 非 JSON：按原始文本处理 */ }
+  return Buffer.from(text, 'utf8');
+}
+
+// 还原出与 workbuddy-desktop.info 同结构的登录态（含 account / auth）
+function loadWorkbuddySessionFromSecretStore() {
+  const keyNeedle = process.env.CODEBUDDY_SECRET_KEY || 'planning-genie.new.accessTokencn';
+  const blob = readCodeBuddySecretBytes(keyNeedle);
+  const plain = (blob.length > 3 && blob.subarray(0, 3).toString() === OS_CRYPT_MAGIC)
+    ? osCryptDecrypt(blob, osCryptAesKey())
+    : blob; // 少数版本可能明文存放
+  const session = JSON.parse(plain.toString('utf8'));
+  if (!session || !session.auth || typeof session.auth.accessToken !== 'string') {
+    throw new Error('解密后的登录态结构异常（缺少 auth.accessToken）');
+  }
+  return session;
+}
+
+// 统一入口：优先用旧的明文凭据文件；若其 accessToken 已被加密（$wbEncrypted 对象），
+// 则改从 CodeBuddy CN 的 SecretStorage 解密同一登录态。
+function resolveWorkbuddySession() {
+  const authFile = findWorkbuddyAuthFile();
+  if (authFile && fs.existsSync(authFile)) {
+    try {
+      const s = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+      if (s && s.auth && typeof s.auth.accessToken === 'string' && s.auth.accessToken) return s;
+    } catch { /* 解析失败则走加密路径 */ }
+  }
+  return loadWorkbuddySessionFromSecretStore();
+}
+
+function loadWorkbuddy() {
+  const session = resolveWorkbuddySession();
   const auth = session.auth || {};
   const account = session.account || {};
   const token = auth.accessToken;
