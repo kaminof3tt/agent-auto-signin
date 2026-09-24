@@ -19,6 +19,12 @@
  *     其 AES-256 密钥存于 Local State 的 os_crypt.encrypted_key（DPAPI 保护）。
  *     DPAPI 优先用 WorkBuddy 自带 koffi 直接调用 crypt32（**不创建子进程**，受限会话亦可），
  *     失败再回退 PowerShell / 内置 Python。
+ *
+ *     注意（重要）：CodeBuddy CN 的 SecretStorage 是一份**静态快照**——只有 CodeBuddy CN
+ *     客户端在运行才会刷新它。若该客户端已被卸载，快照里的 accessToken 到期后无人续期，
+ *     脚本会在到期日突然以 401 失败。因此脚本会在到期前 WORKBUDDY_TOKEN_WARN_DAYS 天
+ *     （默认 14 天）解析 JWT exp 并写入 critical.log 预警。
+ *     恢复方式：启动一次 CodeBuddy CN 并登录，或改回读取 WorkBuddy 自身凭据（需客户端未加密）。
  *   - Trae：签到 + 令牌自动续期（临近过期时用设备密钥对调用官方接口，写回 storage.json）
  *   - 内置每日自动运行（常驻守护，默认每天 09:30，可用环境变量 CHECKIN_TIME / CHECKIN_TIMES 覆盖）
  *   - 幂等保护（已在检查查询层兜底"今日已签到"）
@@ -30,6 +36,9 @@
  *   CHECKIN_BASE_DIR              状态/日志目录（默认 ~/.daily-checkin）
  *   TRAE_AUTH_FILE                Trae storage.json 路径（默认按已安装版本自动探测）
  *   WORKBUDDY_AUTH_FILE           WorkBuddy 凭据文件路径（默认自动探测）
+ *   WORKBUDDY_TOKEN_WARN_DAYS     WorkBuddy accessToken 临期告警阈值（天，默认 14）
+ *   CODEBUDDY_STATE_DB            CodeBuddy state.vscdb 路径（默认按已安装版本自动探测）
+ *   CODEBUDDY_SECRET_KEY          从 vscdb 中取用的 secret key（默认 planning-genie.new.accessTokencn）
  */
 'use strict';
 const fs = require('fs');
@@ -102,9 +111,10 @@ function log(lines) {
 // 记录需要人工关注的关键问题（间歇性失败 / 凭证失效 / 频控），追加写入以便快速查看
 function logCritical(title, detail) {
   ensureDirs();
-  const line = `[${tsOf()}] ${title}: ${detail}`;
-  log([line]);
-  fs.appendFileSync(CRITICAL_FILE, line + '\n', 'utf8');
+  const now = new Date();
+  // log() 会自行加时间戳前缀，这里只传正文，避免 stdout 出现双时间戳
+  log([`${title}: ${detail}`]);
+  fs.appendFileSync(CRITICAL_FILE, `[${tsOf(now)}] ${title}: ${detail}\n`, 'utf8');
 }
 
 // 防重入锁：以产品名为锁名，使用跨平台可靠的"独占创建"语义（不依赖文件锁权限位）
@@ -402,7 +412,10 @@ function osCryptDecrypt(blob, key) {
 function readCodeBuddySecretBytes(keyNeedle) {
   const dbPath = process.env.CODEBUDDY_STATE_DB
     || path.join(CODEBUDDY_CN_DIR, 'User', 'globalStorage', 'state.vscdb');
-  if (!fs.existsSync(dbPath)) throw new Error(`未找到 CodeBuddy 状态库：${dbPath}`);
+  if (!fs.existsSync(dbPath)) {
+    throw new Error(`未找到 CodeBuddy 状态库：${dbPath}（WorkBuddy 客户端凭据已加密时脚本依赖该文件；`
+      + '请先安装并登录一次 CodeBuddy CN 客户端，或用 CODEBUDDY_STATE_DB 指定其他路径）');
+  }
   let DatabaseSync;
   try { ({ DatabaseSync } = require('node:sqlite')); } catch {
     throw new Error('当前 Node 缺少 node:sqlite（需 Node >= 22.5），无法读取 CodeBuddy 状态库');
@@ -450,6 +463,9 @@ function loadWorkbuddySessionFromSecretStore() {
   return session;
 }
 
+// 最近一次 WorkBuddy 凭据的实际来源（用于到期告警时说明"谁在续期"）
+let WORKBUDDY_CRED_SOURCE = '';
+
 // 统一入口：优先用旧的明文凭据文件；若其 accessToken 已被加密（$wbEncrypted 对象），
 // 则改从 CodeBuddy CN 的 SecretStorage 解密同一登录态。
 function resolveWorkbuddySession() {
@@ -457,10 +473,44 @@ function resolveWorkbuddySession() {
   if (authFile && fs.existsSync(authFile)) {
     try {
       const s = JSON.parse(fs.readFileSync(authFile, 'utf8'));
-      if (s && s.auth && typeof s.auth.accessToken === 'string' && s.auth.accessToken) return s;
+      if (s && s.auth && typeof s.auth.accessToken === 'string' && s.auth.accessToken) {
+        WORKBUDDY_CRED_SOURCE = `${authFile}（明文凭据文件，由 WorkBuddy 客户端续期）`;
+        return s;
+      }
     } catch { /* 解析失败则走加密路径 */ }
   }
+  WORKBUDDY_CRED_SOURCE = 'CodeBuddy CN 本地残留快照 state.vscdb（静态文件，无进程续期）';
   return loadWorkbuddySessionFromSecretStore();
+}
+
+// ---------------- 令牌到期预警 ----------------
+// 背景：当明文凭据文件被客户端加密后，脚本改从 CodeBuddy CN 的 state.vscdb 取登录态，
+// 那是一份"静态快照"——只有 CodeBuddy CN 客户端在跑才会刷新它。若该客户端已卸载/长期不启动，
+// accessToken 到期后将无人续期，脚本会在到期日突然以 401 失败。
+// 这里解析 JWT 的 exp，临期前提前写 critical.log 告警，把"静默失败"变成"可预期事件"。
+const TOKEN_EXPIRY_WARN_DAYS = Number(process.env.WORKBUDDY_TOKEN_WARN_DAYS || 14);
+let TOKEN_EXPIRY_WARNED = false;
+
+function decodeJwtExp(token) {
+  const parts = String(token).split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return typeof payload.exp === 'number' ? payload.exp * 1000 : null;
+  } catch { return null; }
+}
+
+function warnIfTokenExpiringSoon(token) {
+  if (TOKEN_EXPIRY_WARNED) return; // 每轮只告警一次，避免守护模式刷屏
+  const expMs = decodeJwtExp(token);
+  if (!expMs) return;
+  const daysLeft = (expMs - Date.now()) / 86400000;
+  if (daysLeft > TOKEN_EXPIRY_WARN_DAYS) return;
+  TOKEN_EXPIRY_WARNED = true;
+  const when = new Date(expMs).toISOString().replace('T', ' ').slice(0, 16);
+  logCritical('WorkBuddy 凭据即将到期',
+    `accessToken 将于 ${when} UTC 到期（剩余 ${daysLeft.toFixed(1)} 天，来源：${WORKBUDDY_CRED_SOURCE}）。`
+    + '到期后需先让凭据来源恢复刷新（例如启动一次 CodeBuddy CN 并登录），否则签到会重新出现 HTTP 401。');
 }
 
 function loadWorkbuddy() {
@@ -470,6 +520,7 @@ function loadWorkbuddy() {
   const token = auth.accessToken;
   const uid = account.uid;
   if (!token || !uid) throw new Error('本地会话缺少 accessToken/uid，请先在 WorkBuddy 客户端登录');
+  warnIfTokenExpiringSoon(token);
   const headers = {
     Accept: 'application/json',
     Authorization: `Bearer ${token}`,
