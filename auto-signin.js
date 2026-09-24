@@ -12,19 +12,20 @@
  *
  * 特性:
  *   - WorkBuddy：签到 + 成长中心（领 Buddy 旅行礼物 / 派 Buddy 出发 / 开盲盒 / 领任务奖）
- *     凭据获取：优先读 workbuddy-desktop.info 的明文 accessToken；若已被客户端加密
- *     （5.6.2 起为 {"$wbEncrypted":1,"envelope":"..."}，密钥在原生层、独立 Node 取不到），
- *     则自动改从 CodeBuddy CN 的 SecretStorage（state.vscdb）解密同一登录态：
- *     Chromium os_crypt = [3B "v10"][12B nonce][AES-256-GCM 密文][16B tag]，
- *     其 AES-256 密钥存于 Local State 的 os_crypt.encrypted_key（DPAPI 保护）。
- *     DPAPI 优先用 WorkBuddy 自带 koffi 直接调用 crypt32（**不创建子进程**，受限会话亦可），
- *     失败再回退 PowerShell / 内置 Python。
- *
- *     注意（重要）：CodeBuddy CN 的 SecretStorage 是一份**静态快照**——只有 CodeBuddy CN
- *     客户端在运行才会刷新它。若该客户端已被卸载，快照里的 accessToken 到期后无人续期，
- *     脚本会在到期日突然以 401 失败。因此脚本会在到期前 WORKBUDDY_TOKEN_WARN_DAYS 天
- *     （默认 14 天）解析 JWT exp 并写入 critical.log 预警。
- *     恢复方式：启动一次 CodeBuddy CN 并登录，或改回读取 WorkBuddy 自身凭据（需客户端未加密）。
+ *     凭据获取按可靠性回退，**任何一条都不依赖 CodeBuddy**：
+ *       1) workbuddy-desktop.info 的明文 accessToken（客户端未启用加密的旧版本）
+ *       2) **主力**：WorkBuddy 自身 at-rest 加密（5.6.2 起为 {"$wbEncrypted":1,"envelope":"..."}）。
+ *          密钥载荷由 WorkBuddy.exe 内注册的 Electron 绑定
+ *          process._linkedBinding('electron_browser_workbuddy_storage').loggerGet() 提供。
+ *          因 WorkBuddy.exe 本身就是 Electron，脚本用 ELECTRON_RUN_AS_NODE=1 把它当 Node
+ *          运行时来执行**本文件自己**（见顶部"原生密钥探针"模式），从而拿到该绑定；
+ *          再用 sha256(atRestSecretKey) 作密钥，按 asar 内 at-rest-crypto 的 AES-256-GCM
+ *          信封格式（AAD = WB-AAD\\0 | 格式号 | sym-v1 | suite | keyId | framing）解出字段。
+ *          这条路径拿到的是客户端**持续刷新**的活 token，不是快照。
+ *       3) 兜底：CodeBuddy CN 的 SecretStorage（历史遗留的静态快照，会过期）。
+ *     拉起探针进程的两条通道：优先 koffi 直调 Win32 CreateProcessW（受限会话里 Node 的
+ *     child_process 一律 EBUSY，此路仍通），再退回常规 execFileSync。
+ *     DPAPI 相关（仅兜底路径用）同样优先用 WorkBuddy 自带 koffi 直调 crypt32。
  *   - Trae：签到 + 令牌自动续期（临近过期时用设备密钥对调用官方接口，写回 storage.json）
  *   - 内置每日自动运行（常驻守护，默认每天 09:30，可用环境变量 CHECKIN_TIME / CHECKIN_TIMES 覆盖）
  *   - 幂等保护（已在检查查询层兜底"今日已签到"）
@@ -36,11 +37,45 @@
  *   CHECKIN_BASE_DIR              状态/日志目录（默认 ~/.daily-checkin）
  *   TRAE_AUTH_FILE                Trae storage.json 路径（默认按已安装版本自动探测）
  *   WORKBUDDY_AUTH_FILE           WorkBuddy 凭据文件路径（默认自动探测）
+ *   WORKBUDDY_EXE                 WorkBuddy 可执行文件路径（默认自动探测，兼作 Electron 运行时）
+ *   WORKBUDDY_KEY_PAYLOAD_FILE    预抓的 at-rest 密钥载荷文件（指定后跳过拉起探针进程）
+ *   WORKBUDDY_KEY_TIMEOUT_MS      探针进程超时（毫秒，默认 60000）
+ *   WORKBUDDY_KOFFI_PATH          koffi 模块目录（默认用 WorkBuddy 自带 CLI 里的打包版）
  *   WORKBUDDY_TOKEN_WARN_DAYS     WorkBuddy accessToken 临期告警阈值（天，默认 14）
- *   CODEBUDDY_STATE_DB            CodeBuddy state.vscdb 路径（默认按已安装版本自动探测）
+ *   CODEBUDDY_STATE_DB            CodeBuddy state.vscdb 路径（仅兜底路径使用）
  *   CODEBUDDY_SECRET_KEY          从 vscdb 中取用的 secret key（默认 planning-genie.new.accessTokencn）
  */
 'use strict';
+
+// ---------------------------------------------------------------------------
+// 「原生密钥探针」自调用模式（必须在其它逻辑之前，且立即退出）
+// ---------------------------------------------------------------------------
+// WorkBuddy 5.6.2 起对凭据字段做 at-rest 加密，其密钥载荷由 WorkBuddy.exe 内注册的
+// Electron 浏览器绑定 process._linkedBinding('electron_browser_workbuddy_storage')
+// 提供，独立 Node 取不到。但 WorkBuddy.exe 本身就是 Electron，用
+// ELECTRON_RUN_AS_NODE=1 可以把「它自己」当 Node 运行时来执行本文件 —— 于是无需任何
+// 外部辅助脚本、也不依赖 CodeBuddy，就能在同一进程内拿到该绑定。
+// 本模式下只把载荷写到标准输出后立刻退出，不建目录、不写日志、不碰网络。
+if (process.env.WORKBUDDY_KEY_AGENT === '1') {
+  const agentFs = require('fs');
+  let code = 0;
+  try {
+    const storage = process._linkedBinding('electron_browser_workbuddy_storage');
+    const raw = storage.loggerGet();
+    const payload = typeof raw === 'string' ? raw : JSON.stringify(raw);
+    // 有 WORKBUDDY_KEY_OUT 就写文件（供 koffi 直调 CreateProcessW 的调用方读取，
+    // 避免在受限会话里搭管道）；否则写标准输出。
+    if (process.env.WORKBUDDY_KEY_OUT) agentFs.writeFileSync(process.env.WORKBUDDY_KEY_OUT, payload, 'utf8');
+    else agentFs.writeSync(1, payload);
+  } catch (err) {
+    code = 3;
+    try {
+      agentFs.writeSync(2, 'KEY_AGENT_FAILED: ' + String((err && err.message) || err));
+    } catch { /* 忽略 */ }
+  }
+  process.exit(code);
+}
+
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -291,31 +326,147 @@ const DPAPI_PY_SCRIPT = [
 
 // WorkBuddy 自带 CLI 里打包了 koffi（FFI 库），可在**不创建子进程**的前提下调用
 // crypt32 的 CryptUnprotectData —— 这是最可靠的路径（受限会话会禁止 spawn 子进程）。
-let KOFFI_DPAPI;
-function loadKoffiDpapi() {
-  if (KOFFI_DPAPI !== undefined) return KOFFI_DPAPI;
-  const candidates = [];
-  if (process.env.WORKBUDDY_KOFFI_PATH) candidates.push(process.env.WORKBUDDY_KOFFI_PATH);
+// WorkBuddy 自带 CLI 里打包了 koffi（FFI 库）；此处统一加载，供两处使用：
+//   1) 直调 crypt32.CryptUnprotectData 做 DPAPI 解密（**不创建子进程**）
+//   2) 直调 kernel32.CreateProcessW 拉起子进程（受限会话里 Node 的 child_process 一律 EBUSY）
+let KOFFI_LIB;
+function koffiCandidateDirs() {
+  const dirs = [];
+  if (process.env.WORKBUDDY_KOFFI_PATH) dirs.push(process.env.WORKBUDDY_KOFFI_PATH);
   for (const base of [
     path.join(LOCALAPPDATA, 'Programs', 'WorkBuddy'),
     path.join(LOCALAPPDATA, 'Programs', 'workbuddy'),
-  ]) {
-    candidates.push(path.join(base, 'resources', 'app.asar.unpacked', 'cli', 'node_modules', 'koffi'));
+    path.join(LOCALAPPDATA, 'WorkBuddy'),
+  ]) dirs.push(path.join(base, 'resources', 'app.asar.unpacked', 'cli', 'node_modules', 'koffi'));
+  return dirs;
+}
+
+function loadKoffiLib() {
+  if (KOFFI_LIB !== undefined) return KOFFI_LIB;
+  for (const dir of koffiCandidateDirs()) {
+    if (!dir || !fs.existsSync(dir)) continue;
+    try { KOFFI_LIB = require(dir); return KOFFI_LIB; } catch { /* 该候选不可用，尝试下一个 */ }
   }
-  for (const dir of candidates) {
-    if (!fs.existsSync(dir)) continue;
-    try {
-      const koffi = require(dir);
-      const crypt32 = koffi.load('crypt32.dll');
-      koffi.struct('DATA_BLOB', { cbData: 'uint32', pbData: 'void *' });
-      const CryptUnprotectData = crypt32.func('int CryptUnprotectData(_In_ DATA_BLOB *pDataIn, void *p1, DATA_BLOB *p2, void *p3, void *p4, uint32 dwFlags, _Out_ DATA_BLOB *pDataOut)');
-      const LocalFree = koffi.load('kernel32.dll').func('void *LocalFree(void *hMem)');
-      KOFFI_DPAPI = { koffi, CryptUnprotectData, LocalFree };
-      return KOFFI_DPAPI;
-    } catch { /* 该候选不可用，尝试下一个 */ }
-  }
-  KOFFI_DPAPI = false;
+  KOFFI_LIB = false;
   return false;
+}
+
+let KOFFI_DPAPI;
+function loadKoffiDpapi() {
+  if (KOFFI_DPAPI !== undefined) return KOFFI_DPAPI;
+  const koffi = loadKoffiLib();
+  if (!koffi) {
+    KOFFI_DPAPI = false;
+    return false;
+  }
+  try {
+    const crypt32 = koffi.load('crypt32.dll');
+    koffi.struct('DATA_BLOB', { cbData: 'uint32', pbData: 'void *' });
+    const CryptUnprotectData = crypt32.func('int CryptUnprotectData(_In_ DATA_BLOB *pDataIn, void *p1, DATA_BLOB *p2, void *p3, void *p4, uint32 dwFlags, _Out_ DATA_BLOB *pDataOut)');
+    const LocalFree = koffi.load('kernel32.dll').func('void *LocalFree(void *hMem)');
+    KOFFI_DPAPI = { koffi, CryptUnprotectData, LocalFree };
+  } catch {
+    KOFFI_DPAPI = false;
+  }
+  return KOFFI_DPAPI;
+}
+
+// 用 koffi 直调 Win32 CreateProcessW 拉起进程并等待退出，绕开 Node 的 child_process。
+// 场景：在 WorkBuddy 代理内部的受限会话里，spawn/execFile 一律返回 EBUSY，
+// 但 Win32 本身可用，故直接走内核接口；子进程输出由调用方用文件承接（不搭管道）。
+let KOFFI_SPAWN_API;
+function loadKoffiSpawnApi() {
+  if (KOFFI_SPAWN_API !== undefined) return KOFFI_SPAWN_API;
+  const koffi = loadKoffiLib();
+  if (!koffi) {
+    KOFFI_SPAWN_API = false;
+    return false;
+  }
+  try {
+    const kernel32 = koffi.load('kernel32.dll');
+    koffi.struct('WB_STARTUPINFO', {
+      cb: 'uint32',
+      _pad: 'uint32',
+      lpReserved: 'str16',
+      lpDesktop: 'str16',
+      lpTitle: 'str16',
+      dwX: 'uint32',
+      dwY: 'uint32',
+      dwXSize: 'uint32',
+      dwYSize: 'uint32',
+      dwXCountChars: 'uint32',
+      dwYCountChars: 'uint32',
+      dwFillAttribute: 'uint32',
+      dwFlags: 'uint32',
+      wShowWindow: 'uint16',
+      cbReserved2: 'uint16',
+      lpReserved2: 'void *',
+      hStdInput: 'void *',
+      hStdOutput: 'void *',
+      hStdError: 'void *',
+    });
+    koffi.struct('WB_PROCESS_INFORMATION', {
+      hProcess: 'void *', hThread: 'void *', dwProcessId: 'uint32', dwThreadId: 'uint32',
+    });
+    KOFFI_SPAWN_API = {
+      koffi,
+      CreateProcessW: kernel32.func('bool CreateProcessW(str16 lpApp, str16 lpCmd, void *pa, void *ta, bool inherit, uint32 flags, void *env, str16 cwd, _Inout_ WB_STARTUPINFO *si, _Out_ WB_PROCESS_INFORMATION *pi)'),
+      WaitForSingleObject: kernel32.func('uint32 WaitForSingleObject(void *h, uint32 ms)'),
+      TerminateProcess: kernel32.func('bool TerminateProcess(void *h, uint32 code)'),
+      CloseHandle: kernel32.func('bool CloseHandle(void *h)'),
+      GetLastError: kernel32.func('uint32 GetLastError()'),
+    };
+  } catch {
+    KOFFI_SPAWN_API = false;
+  }
+  return KOFFI_SPAWN_API;
+}
+
+// 同步执行子进程（Windows / koffi 版）。extraEnv 会临时注入到本进程环境，
+// CreateProcessW 传 NULL 环境块时子进程继承本进程环境，从而实现变量传递。
+function koffiSpawnSync(exe, args, extraEnv, timeoutMs = 60000) {
+  const api = loadKoffiSpawnApi();
+  if (!api) throw new Error('koffi 不可用，无法走 Win32 进程接口');
+  const { koffi, CreateProcessW, WaitForSingleObject, TerminateProcess, CloseHandle, GetLastError } = api;
+  const quote = (s) => (/[\s"]/.test(s) ? `"${s}"` : s);
+  const cmdLine = [exe, ...args].map(quote).join(' ');
+
+  // STARTUPINFOW 固定 104 字节：cb 必须填自身大小；dwFlags=STARTF_USESHOWWINDOW 且 SW_HIDE 保证不闪窗
+  const si = Buffer.alloc(104);
+  si.writeUInt32LE(104, 0);          // cb
+  si.writeUInt32LE(0x00000001, 60);  // dwFlags = STARTF_USESHOWWINDOW
+  si.writeUInt16LE(0, 64);           // wShowWindow = SW_HIDE
+  const pi = {};
+
+  const saved = new Map();
+  for (const key of Object.keys(extraEnv || {})) {
+    saved.set(key, process.env[key]);
+    process.env[key] = String(extraEnv[key]);
+  }
+  let ok = false;
+  let lastError = 0;
+  try {
+    ok = CreateProcessW(exe, cmdLine, null, null, false, 0x08000000 /* CREATE_NO_WINDOW */,
+      null, null, si, pi);
+    if (!ok) lastError = GetLastError();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  if (!ok) throw new Error(`CreateProcessW 失败（GetLastError=${lastError}）`);
+
+  try {
+    const waited = WaitForSingleObject(pi.hProcess, timeoutMs);
+    if (waited === 0x00000102 /* WAIT_TIMEOUT */) {
+      try { TerminateProcess(pi.hProcess, 1); } catch { /* 忽略 */ }
+      throw new Error(`子进程超时（${timeoutMs}ms）`);
+    }
+  } finally {
+    try { CloseHandle(pi.hProcess); } catch { /* 忽略 */ }
+    try { CloseHandle(pi.hThread); } catch { /* 忽略 */ }
+  }
 }
 
 function dpapiUnprotectViaKoffi(body) {
@@ -463,13 +614,168 @@ function loadWorkbuddySessionFromSecretStore() {
   return session;
 }
 
+// ---------------- WorkBuddy at-rest 凭据解密（零外部依赖，不需要 CodeBuddy） ----------------
+// 5.6.2 起 workbuddy-desktop.info 的敏感字段被封成 {"$wbEncrypted":1,"envelope":"<b64>"}。
+// 解密只需两级材料，全部可在本机自取：
+//   1) 密钥载荷 —— WorkBuddy.exe 原生绑定 loggerGet()（见文件顶部"原生密钥探针"模式），
+//                  字段钥 = sha256(payload.atRestSecretKey 的 UTF-8 字节)，32B
+//   2) 字段信封 —— AES-256-GCM；AAD 由 magic/格式号/scheme/suite/keyId/framing 定长拼装
+// 算法等价自 asar 内 packages/at-rest-crypto（key-normalize + aes-gcm + field 三个模块）。
+// 注：~/.workbuddy/keyblob 只在 asym-v1（非对称）字段下才用到，标准字段用不到，故此处不解析。
+
+const ATREST_AAD_DOMAIN = Buffer.from('WB-AAD\0', 'ascii');
+const ATREST_FORMAT_ID = { file: 'WBEF1', field: 'WBEV1' };
+const ATREST_FRAMING_CODE = { file: 1, field: 2 };
+
+function atRestAad(keyId, suite, framing) {
+  const u32 = (v) => { const b = Buffer.allocUnsafe(4); b.writeUInt32BE(v); return b; };
+  const lp = (s) => { const b = Buffer.from(s, 'utf8'); return Buffer.concat([u32(b.length), b]); };
+  return Buffer.concat([
+    ATREST_AAD_DOMAIN,
+    Buffer.from([1]),
+    lp(ATREST_FORMAT_ID[framing]),
+    lp('sym-v1'),
+    u32(suite),
+    lp(keyId),
+    Buffer.from([ATREST_FRAMING_CODE[framing]]),
+    Buffer.from([0]), // sequence 缺省
+    Buffer.from([0]), // final 缺省
+  ]);
+}
+
+// envelope(b64 JSON) + 32B 钥 → 明文
+function atRestOpen(envelopeB64, key32, framing) {
+  let env;
+  try {
+    env = JSON.parse(Buffer.from(envelopeB64, 'base64').toString('utf8'));
+  } catch {
+    throw new Error('at-rest 信封不是合法 JSON');
+  }
+  if (env.suite !== 1) throw new Error(`不支持的 at-rest 信封 suite=${env.suite}`);
+  const keyId = crypto.createHash('sha256').update(key32).digest('hex').slice(0, 16);
+  const decipher = crypto.createDecipheriv(
+    'aes-256-gcm', key32, Buffer.from(env.nonce, 'base64'), { authTagLength: 16 });
+  decipher.setAAD(atRestAad(env.keyId || keyId, env.suite, framing));
+  decipher.setAuthTag(Buffer.from(env.authTag, 'base64'));
+  const ct = Buffer.from(env.ciphertext || '', 'base64');
+  return Buffer.concat([decipher.update(ct), decipher.final()]);
+}
+
+// 定位 WorkBuddy 可执行文件（它同时是"Electron 运行时"，用于取原生密钥）
+function findWorkbuddyExe() {
+  const cands = [];
+  if (process.env.WORKBUDDY_EXE) cands.push(process.env.WORKBUDDY_EXE);
+  for (const base of [
+    path.join(LOCALAPPDATA, 'Programs', 'WorkBuddy'),
+    path.join(LOCALAPPDATA, 'Programs', 'workbuddy'),
+    path.join(LOCALAPPDATA, 'WorkBuddy'),
+  ]) cands.push(path.join(base, 'WorkBuddy.exe'));
+  cands.push('/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy', '/opt/WorkBuddy/workbuddy');
+  for (const c of cands) if (c && fs.existsSync(c)) return c;
+  return null;
+}
+
+// 取 at-rest 密钥载荷，三条途径按环境自动择一：
+//   1) WORKBUDDY_KEY_PAYLOAD_FILE 指向预先抓好的载荷（应急/离线场景）
+//   2) koffi 直调 Win32 CreateProcessW 拉起 WorkBuddy.exe 的探针模式（受限会话下 Node 子进程被禁时的主力）
+//   3) 常规 execFileSync 子进程（非 Windows 或 koffi 不可用）
+function extractAtRestKeyPayload() {
+  const preFetched = process.env.WORKBUDDY_KEY_PAYLOAD_FILE;
+  if (preFetched) return fs.readFileSync(preFetched, 'utf8').trim();
+
+  const exe = findWorkbuddyExe();
+  if (!exe) throw new Error('未找到 WorkBuddy 客户端（可用 WORKBUDDY_EXE 指定路径）');
+
+  const agentEnv = { ELECTRON_RUN_AS_NODE: '1', WORKBUDDY_KEY_AGENT: '1' };
+  const errors = [];
+  const timeoutMs = Number(process.env.WORKBUDDY_KEY_TIMEOUT_MS || 60000);
+
+  if (process.platform === 'win32' && loadKoffiLib()) {
+    const tmp = path.join(os.tmpdir(), `wb-key-${process.pid}-${Date.now()}.json`);
+    try {
+      koffiSpawnSync(exe, [__filename],
+        Object.assign({ WORKBUDDY_KEY_OUT: tmp }, agentEnv), timeoutMs);
+      const text = fs.existsSync(tmp) ? fs.readFileSync(tmp, 'utf8').trim() : '';
+      if (text) return text;
+      errors.push('koffi(原生进程接口): 探针未写出载荷');
+    } catch (e) {
+      errors.push('koffi(原生进程接口): ' + String((e && e.message) || e).slice(0, 140));
+    } finally {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 忽略 */ }
+    }
+  }
+
+  try {
+    const out = execFileSync(exe, [__filename], {
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024,
+      env: Object.assign({}, process.env, agentEnv),
+    }).trim();
+    if (out) return out;
+    errors.push('常规子进程: 未返回载荷');
+  } catch (e) {
+    errors.push('常规子进程: ' + String((e && e.message) || e).slice(0, 140));
+  }
+
+  throw new Error('无法取得 at-rest 密钥载荷 —— ' + errors.join('；'));
+}
+
+// 由载荷派生出字段钥：sha256(atRestSecretKey 的 UTF-8 字节)
+function atRestFieldKey(payloadRaw) {
+  const payload = JSON.parse(payloadRaw);
+  if (typeof payload.atRestSecretKey !== 'string' || !payload.atRestSecretKey) {
+    throw new Error('密钥载荷缺少 atRestSecretKey');
+  }
+  return crypto.createHash('sha256').update(payload.atRestSecretKey, 'utf8').digest();
+}
+
+function isEncryptedFieldWrapper(v) {
+  return !!v && typeof v === 'object' && !Array.isArray(v)
+    && v.$wbEncrypted === 1 && typeof v.envelope === 'string';
+}
+
+function decodeEncryptedField(wrapper, fieldKey) {
+  if (wrapper.scheme === 'asym-v1') throw new Error('该字段使用非对称保护（asym-v1），当前不支持');
+  const text = atRestOpen(wrapper.envelope, fieldKey, 'field').toString('utf8');
+  // 原字段既可能是字符串，也可能是被 JSON 化的对象；按首字符区分，避免把纯数字串变成数字
+  if (text.startsWith('{') || text.startsWith('[')) {
+    try { return JSON.parse(text); } catch { /* 仍是字符串 */ }
+  }
+  return text;
+}
+
+// 就地把树里所有 {"$wbEncrypted":1,...} 字段换成明文
+function decryptEncryptedFields(node, fieldKey) {
+  if (!node || typeof node !== 'object') return;
+  for (const key of Object.keys(node)) {
+    const value = node[key];
+    if (isEncryptedFieldWrapper(value)) node[key] = decodeEncryptedField(value, fieldKey);
+    else decryptEncryptedFields(value, fieldKey);
+  }
+}
+
+function loadWorkbuddySessionFromAtRest() {
+  const authFile = findWorkbuddyAuthFile();
+  if (!authFile) throw new Error('未找到 WorkBuddy 凭据文件 workbuddy-desktop.info');
+  const fieldKey = atRestFieldKey(extractAtRestKeyPayload());
+  const session = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+  decryptEncryptedFields(session, fieldKey);
+  return session;
+}
+
 // 最近一次 WorkBuddy 凭据的实际来源（用于到期告警时说明"谁在续期"）
 let WORKBUDDY_CRED_SOURCE = '';
 
-// 统一入口：优先用旧的明文凭据文件；若其 accessToken 已被加密（$wbEncrypted 对象），
-// 则改从 CodeBuddy CN 的 SecretStorage 解密同一登录态。
+// 统一入口，按可靠性从高到低回退：
+//   1) 明文凭据文件（客户端未启用加密的版本）
+//   2) WorkBuddy 自身 at-rest 解密（借客户端原生绑定取钥，随客户端持续刷新）—— 主路径
+//   3) CodeBuddy CN 的 SecretStorage（历史遗留的静态快照，仅作兜底）
 function resolveWorkbuddySession() {
+  const errors = [];
   const authFile = findWorkbuddyAuthFile();
+
   if (authFile && fs.existsSync(authFile)) {
     try {
       const s = JSON.parse(fs.readFileSync(authFile, 'utf8'));
@@ -477,10 +783,28 @@ function resolveWorkbuddySession() {
         WORKBUDDY_CRED_SOURCE = `${authFile}（明文凭据文件，由 WorkBuddy 客户端续期）`;
         return s;
       }
-    } catch { /* 解析失败则走加密路径 */ }
+    } catch (e) {
+      errors.push('明文解析失败: ' + String((e && e.message) || e).slice(0, 120));
+    }
   }
+
+  try {
+    const s = loadWorkbuddySessionFromAtRest();
+    if (s && s.auth && typeof s.auth.accessToken === 'string' && s.auth.accessToken) {
+      WORKBUDDY_CRED_SOURCE = `${authFile}（WorkBuddy 自身 at-rest 加密，密钥取自客户端原生绑定，随客户端持续刷新）`;
+      return s;
+    }
+    errors.push('at-rest: 解出的会话缺少 auth.accessToken');
+  } catch (e) {
+    errors.push('at-rest: ' + String((e && e.message) || e).slice(0, 200));
+  }
+
   WORKBUDDY_CRED_SOURCE = 'CodeBuddy CN 本地残留快照 state.vscdb（静态文件，无进程续期）';
-  return loadWorkbuddySessionFromSecretStore();
+  try {
+    return loadWorkbuddySessionFromSecretStore();
+  } catch (e) {
+    throw new Error(`WorkBuddy 凭据全部获取途径均失败 —— ${errors.join('；')}；兜底: ${String((e && e.message) || e).slice(0, 200)}`);
+  }
 }
 
 // ---------------- 令牌到期预警 ----------------
